@@ -34,12 +34,80 @@ const generateFilenameFromUrl = (url: string): string => {
   }
 };
 
+// IndexedDB cache management
+const initializeDB = (): Promise<IDBDatabase> => {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('pdfCache', 1);
+    
+    request.onerror = () => reject(new Error('Failed to open database'));
+    
+    request.onupgradeneeded = (event) => {
+      const db = (event.target as IDBOpenDBRequest).result;
+      if (!db.objectStoreNames.contains('pdfs')) {
+        const store = db.createObjectStore('pdfs', { keyPath: 'cacheKey' });
+        store.createIndex('timestamp', 'timestamp', { unique: false });
+      }
+    };
+    
+    request.onsuccess = (event) => resolve((event.target as IDBOpenDBRequest).result);
+  });
+};
+
+const generateCacheKey = (url: string, pageSize: PageSize): string => {
+  return `${url}|${pageSize}`;
+};
+
+const savePdfToCache = async (url: string, pageSize: PageSize, blob: Blob): Promise<void> => {
+  try {
+    const db = await initializeDB();
+    const tx = db.transaction('pdfs', 'readwrite');
+    const store = tx.objectStore('pdfs');
+    
+    const cacheEntry = {
+      cacheKey: generateCacheKey(url, pageSize),
+      url,
+      pageSize,
+      blob,
+      timestamp: Date.now()
+    };
+    
+    await new Promise<void>((resolve, reject) => {
+      const request = store.put(cacheEntry);
+      request.onsuccess = () => resolve();
+      request.onerror = () => reject(new Error('Failed to save PDF to cache'));
+    });
+  } catch (error) {
+    console.error('Error saving to cache:', error);
+  }
+};
+
+const getPdfFromCache = async (url: string, pageSize: PageSize): Promise<Blob | null> => {
+  try {
+    const db = await initializeDB();
+    const tx = db.transaction('pdfs', 'readonly');
+    const store = tx.objectStore('pdfs');
+    const cacheKey = generateCacheKey(url, pageSize);
+    
+    const result = await new Promise<any>((resolve, reject) => {
+      const request = store.get(cacheKey);
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(new Error('Failed to get PDF from cache'));
+    });
+    
+    return result?.blob || null;
+  } catch (error) {
+    console.error('Error retrieving from cache:', error);
+    return null;
+  }
+};
+
 export default function Home() {
   const [url, setUrl] = useState('');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pageSize, setPageSize] = useState<PageSize>('a4');
   const [conversionCount, setConversionCount] = useState(0);
+  const [cacheStatus, setCacheStatus] = useState<'hit' | 'miss' | null>(null);
 
   useEffect(() => {
     const count = localStorage.getItem('conversionCount');
@@ -54,8 +122,7 @@ export default function Home() {
     localStorage.setItem('conversionCount', newCount.toString());
   }, [conversionCount]);
 
-  const handleDownload = useCallback(async (response: Response, url: string) => {
-    const blob = await response.blob();
+  const handleDownload = useCallback(async (blob: Blob, url: string) => {
     const downloadUrl = URL.createObjectURL(blob);
     const filename = `${generateFilenameFromUrl(url)}.pdf`;
 
@@ -74,20 +141,38 @@ export default function Home() {
 
     setIsLoading(true);
     setError(null);
+    setCacheStatus(null);
 
     try {
-      const response = await fetch('/api/pdf', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, pageSize }),
-      });
+      // Check cache first
+      const cachedPdf = await getPdfFromCache(url, pageSize);
+      
+      if (cachedPdf) {
+        // Use cached PDF if available
+        setCacheStatus('hit');
+        await handleDownload(cachedPdf, url);
+      } else {
+        // Otherwise fetch from server
+        setCacheStatus('miss');
+        const response = await fetch('/api/pdf', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url, pageSize }),
+        });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.error || 'Failed to generate PDF');
+        if (!response.ok) {
+          const errorData = await response.json();
+          throw new Error(errorData.error || 'Failed to generate PDF');
+        }
+
+        const blob = await response.blob();
+        
+        // Save to cache
+        await savePdfToCache(url, pageSize, blob);
+        
+        await handleDownload(blob, url);
       }
-
-      await handleDownload(response, url);
+      
       updateConversionCount();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
@@ -182,6 +267,12 @@ export default function Home() {
         {error && (
           <div className="mt-8 p-4 border border-[#ff5555]/20 bg-[#ff5555]/10 text-[#ff5555]">
             $ Error: {error}
+          </div>
+        )}
+
+        {cacheStatus && (
+          <div className={`mt-8 p-4 border ${cacheStatus === 'hit' ? 'border-[#50fa7b]/20 bg-[#50fa7b]/10 text-[#50fa7b]' : 'border-[#8be9fd]/20 bg-[#8be9fd]/10 text-[#8be9fd]'}`}>
+            $ Cache {cacheStatus === 'hit' ? 'hit: PDF loaded from local storage' : 'miss: PDF generated from server'}
           </div>
         )}
 
